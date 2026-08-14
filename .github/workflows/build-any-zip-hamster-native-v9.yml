@@ -1,0 +1,179 @@
+name: Build Hamster Native APK From Any ZIP
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main, master ]
+
+permissions:
+  contents: read
+
+jobs:
+  build-release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android SDK 36
+        shell: bash
+        run: |
+          set -euo pipefail
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager \
+            "platform-tools" \
+            "platforms;android-36" \
+            "build-tools;36.0.0"
+
+      - name: Set up Gradle 9.5.0
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '9.5.0'
+
+      - name: Find source ZIP automatically
+        id: zip
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+
+          root = Path(os.environ['GITHUB_WORKSPACE'])
+          zips = []
+          for path in root.rglob('*.zip'):
+              if not path.is_file():
+                  continue
+              rel = path.relative_to(root)
+              if '.git' in rel.parts or '.github' in rel.parts:
+                  continue
+              zips.append(path)
+
+          if not zips:
+              raise SystemExit('ERROR: No ZIP file found in repository.')
+
+          selected = max(zips, key=lambda p: p.stat().st_size)
+          print(f'Selected ZIP: {selected.name} ({selected.stat().st_size} bytes)')
+          with open(os.environ['GITHUB_OUTPUT'], 'a', encoding='utf-8') as f:
+              f.write(f'path={selected}\n')
+          PY
+
+      - name: Extract source ZIP inside runner
+        id: project
+        shell: bash
+        env:
+          ZIP_PATH: ${{ steps.zip.outputs.path }}
+        run: |
+          set -euo pipefail
+          DEST="$RUNNER_TEMP/hamster-native-source"
+          rm -rf "$DEST"
+          mkdir -p "$DEST"
+          unzip -q "$ZIP_PATH" -d "$DEST"
+
+          PROJECT_ROOT="$(python3 - "$DEST" <<'PY'
+          import sys, zipfile
+          from pathlib import Path
+
+          base = Path(sys.argv[1])
+
+          def find_project(folder):
+              candidates = list(folder.rglob('settings.gradle')) + list(folder.rglob('settings.gradle.kts'))
+              if not candidates:
+                  return None
+              settings = min(candidates, key=lambda p: len(p.relative_to(folder).parts))
+              return settings.parent
+
+          project = find_project(base)
+          if project is None:
+              nested_dir = base / '__nested_zips__'
+              nested_dir.mkdir(exist_ok=True)
+              for idx, z in enumerate(sorted(base.rglob('*.zip'), key=lambda p: p.stat().st_size, reverse=True)):
+                  target = nested_dir / f'zip_{idx}'
+                  target.mkdir(parents=True, exist_ok=True)
+                  try:
+                      with zipfile.ZipFile(z) as archive:
+                          archive.extractall(target)
+                  except Exception:
+                      continue
+                  project = find_project(target)
+                  if project is not None:
+                      break
+
+          if project is None:
+              raise SystemExit('ERROR: Android Gradle project was not found in ZIP or nested ZIPs.')
+          print(project)
+          PY
+          )"
+
+          echo "Project root: $PROJECT_ROOT"
+          echo "root=$PROJECT_ROOT" >> "$GITHUB_OUTPUT"
+
+      - name: Verify original Hamster signing key
+        shell: bash
+        env:
+          PROJECT_ROOT: ${{ steps.project.outputs.root }}
+        run: |
+          set -euo pipefail
+          KEYSTORE="$PROJECT_ROOT/signing/hamster-release.jks"
+          test -f "$KEYSTORE"
+          keytool -list -v \
+            -keystore "$KEYSTORE" \
+            -storepass 1234 \
+            -alias hellosc > "$RUNNER_TEMP/hamster-key.txt"
+          grep -Fq \
+            "07:16:FD:B6:8E:AB:EA:A3:56:37:DC:FC:46:8B:0C:EC:29:76:A8:9B:EC:65:D8:92:04:32:D2:06:41:4F:DE:53" \
+            "$RUNNER_TEMP/hamster-key.txt"
+
+      - name: Build signed Release APK
+        shell: bash
+        env:
+          PROJECT_ROOT: ${{ steps.project.outputs.root }}
+        run: |
+          set -euo pipefail
+          cd "$PROJECT_ROOT"
+          gradle --no-daemon --stacktrace clean :app:assembleRelease
+
+      - name: Verify APK
+        id: apk
+        shell: bash
+        env:
+          PROJECT_ROOT: ${{ steps.project.outputs.root }}
+        run: |
+          set -euo pipefail
+          APK="$PROJECT_ROOT/app/build/outputs/apk/release/app-release.apk"
+          test -f "$APK"
+          chmod +x "$PROJECT_ROOT/scripts/verify-apk.sh"
+          "$PROJECT_ROOT/scripts/verify-apk.sh" "$APK"
+          echo "path=$APK" >> "$GITHUB_OUTPUT"
+
+      - name: Prepare final output
+        shell: bash
+        env:
+          APK_PATH: ${{ steps.apk.outputs.path }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$GITHUB_WORKSPACE/dist"
+          cp "$APK_PATH" "$GITHUB_WORKSPACE/dist/Hamster_Native_v3.1.0_vc9.apk"
+          cd "$GITHUB_WORKSPACE/dist"
+          sha256sum Hamster_Native_v3.1.0_vc9.apk > SHA256SUMS.txt
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Hamster-Native-v3.1.0-vc9
+          path: |
+            dist/Hamster_Native_v3.1.0_vc9.apk
+            dist/SHA256SUMS.txt
+          if-no-files-found: error
+          retention-days: 14
